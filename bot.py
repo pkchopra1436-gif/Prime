@@ -142,7 +142,7 @@ def send_welcome(message):
         status_text = "⏳ *PENDING APPROVAL*\nContact owner for approval"
     
     welcome_msg = (
-        f"🎯 *Cx Pvt DDoS Bot*\n\n"
+        f"🎯 *Po Pvt DDoS Bot*\n\n"
         f"👤 *User:* @{username}\n"
         f"{status_text}\n\n"
         f"📌 *Commands:*\n"
